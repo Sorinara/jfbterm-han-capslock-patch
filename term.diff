@@ -1,0 +1,382 @@
+--- term.c	2008-05-30 01:24:37.000000000 +0900
++++ /tmp/term.c	2013-08-24 23:11:55.871056015 +0900
+@@ -35,6 +35,8 @@
+ #include <dlfcn.h>
+ #include <time.h>
+ #include <sys/types.h>
++#include <sys/kd.h>
++#include <ctype.h>
+ #include <sys/wait.h>
+ #include <sys/time.h>
+ #include <sys/ioctl.h>
+@@ -44,6 +46,7 @@
+ #include <pty.h>
+ #include <utmp.h>
+ #include <grp.h>
++#include <stdarg.h>
+ 
+ #include "term.h"
+ #include "vterm.h"
+@@ -122,7 +125,6 @@
+ 	tfont_ary_final();
+ }
+ 	
+-
+ int tterm_get_ptytty(TTerm* p)
+ {
+ 	if (openpty(&p->ptyfd, &p->ttyfd, p->name, NULL, NULL) < 0) {
+@@ -139,6 +141,82 @@
+ 	if(ioctl(fileno(stdin), TIOCLINUX, &na) == 0) ns = na;
+ 	return ns;
+ }
++
++int get_capslock_state(void)
++{
++	long int na = 0;
++
++	if(ioctl(fileno(stdin), KDGKBLED, &na) == -1){
++        return 0;
++    }
++
++    if(na >= 4){
++        return 1;
++    }
++
++	return 0;
++}
++
++int get_toggle_state(void)
++{
++    // i want use capslock
++    return get_capslock_state();
++    // i want use shift
++    //return get_shift_state();
++}
++
++int reverse_uplower_character(u_char ch_input, u_char *ch_output)
++{
++    int ret = 0;
++
++    // disable capslock effect
++    // LED  == ON && Character == Alphabet
++    if(isalpha((unsigned int)ch_input) != 0){
++        if(isupper((int)ch_input) != 0){
++            // Upppercase   => Lowercase
++            *ch_output = ch_input + 0x20;
++            ret             = 1;
++        }else{
++            // Lowercase    => Uppercase
++            *ch_output = ch_input - 0x20;
++            ret             = 2;
++        }
++    }
++
++    return ret;
++}
++
++void convert_character(int hangul_state, u_char ch_input, u_char *ch_output)
++{  
++    int print_type;
++
++    // korean  -> capslock on  -> convert (lower <-> upper)
++    // english -> capslock off -> literally (...)
++    if(hangul_state == 1){
++        print_type = reverse_uplower_character(ch_input, ch_output);
++    }else{
++        print_type = 0;
++    }
++
++    if(print_type == 0){
++        *ch_output = ch_input;
++    }
++}
++
++void debug_printf(TVterm* ttyfd, const char *fmt, ...)
++{
++    unsigned char buffer[1024] = {0};
++    int string_length = 0;
++    va_list arg;
++
++    va_start(arg, fmt);
++
++    // warning ! overflow!
++    vsprintf(buffer, fmt, arg);
++    string_length = strlen(buffer);
++
++    tvterm_emulate(ttyfd, buffer, string_length);
++}
+ #endif
+ 
+ #define BUF_SIZE 1024
+@@ -148,13 +226,17 @@
+ 
+ 	int ret;
+ 	struct timeval tv;
+-	u_char buf[BUF_SIZE+1];
++	u_char read_buf[BUF_SIZE+1];
+ #if 1 // Hangul
+ 	extern int hangul_state;
+-	extern int hangul_output_code;
++	extern int hangul_output_code;  // UTF-8 ?
+ 	extern int process_hangul_input;
+-	u_char constr[BUF_SIZE+1];
+-	int i, c, show_fig, hconstr = 0;
++	u_char constr[BUF_SIZE+1],
++           han_last_char[BUF_SIZE+1] = {0},
++           capslock_convert_character;
++	int i, show_fig, hconstr = 0;
++    int togglekey_status_old    = 0,
++        togglekey_status        = 0;
+ #endif
+ #ifdef JFB_ENABLE_DIMMER
+ 	u_int idle_time = 0;
+@@ -168,21 +250,21 @@
+ 		die("Cannot get free pty-tty.\n");
+ 	}
+ 
+-	ntio = p->ttysave;
+-	ntio.c_lflag &= ~(ECHO|ISIG|ICANON|XCASE);
+-        ntio.c_iflag = 0;
+-        ntio.c_oflag &= ~OPOST;
+-        ntio.c_cc[VMIN] = 1;
+-        ntio.c_cc[VTIME] = 0;
+-	ntio.c_cflag |= CS8;
+-        ntio.c_line = 0;
++	ntio                = p->ttysave;
++	ntio.c_lflag       &= ~(ECHO|ISIG|ICANON|XCASE);
++    ntio.c_iflag        = 0;
++    ntio.c_oflag       &= ~OPOST;
++    ntio.c_cc[VMIN]     = 1;
++    ntio.c_cc[VTIME]    = 0;
++	ntio.c_cflag       |= CS8;
++    ntio.c_line         = 0;
+ 	tcsetattr(0, TCSAFLUSH, &ntio);
+-/*
+-	write(1, "\x1B[?25l", 6);
+-*/
++
++    /* write(1, "\x1B[?25l", 6); */
+ 
+ 	tvterm_start(&(p->vterm));
+ 	fflush(stdout);
++
+ 	gChildProcessId = fork();
+ 	if (gChildProcessId == 0) {
+ 	    /* child */
+@@ -192,6 +274,7 @@
+ 	    print_strerror("fork");
+ 	    exit(1);
+ 	}
++
+ 	/* parent */
+ 	tterm_set_utmp(p);
+ 	signal(SIGCHLD, sigchld);
+@@ -209,9 +292,14 @@
+ 		FD_ZERO(&fds);
+ 		FD_SET(0,&fds);
+ 		FD_SET(p->ptyfd,&fds);
+-		if (p->ptyfd > max) max = p->ptyfd;
++
++		if (p->ptyfd > max) {
++            max = p->ptyfd;
++        }
++
+ 		ret = select(max+1, &fds, NULL, NULL, &tv);
+-                if (ret == 0 || (ret < 0 && errno == EINTR)) {
++
++        if (ret == 0 || (ret < 0 && errno == EINTR)) {
+ #ifdef JFB_ENABLE_DIMMER
+ 			if (!blank && ++idle_time > DIMMER_TIMEOUT) {
+ 				// Goto blank
+@@ -226,10 +314,13 @@
+ 		if (ret < 0) {
+ 			print_strerror_and_exit("select");
+ 		}
++
+ 		if (FD_ISSET(0, &fds)) {
+-			ret = read(0, buf, BUF_SIZE);
++            ret = read(0, read_buf, BUF_SIZE);
++            
+ #ifdef JFB_ENABLE_DIMMER
+ 			idle_time = 0;
++
+ 			if (blank) {
+ 				// Wakeup console
+ 				blank = 0;
+@@ -238,73 +329,108 @@
+ #endif
+ 			if (ret > 0) {
+ #if 1 // Hangul
+-if(process_hangul_input) {
+-	for(i = 0; i < ret; i++) {
+-		c = buf[i];
+-		if(c == 27 && hangul_state && ret == 1) {
+-			show_fig = hangul_automata_toggle(buf);
+-			if(buf[0] != 0) {
+-				if(hangul_output_code == 0)
+-					write(p->ptyfd, buf, 3);
+-				else
+-					write(p->ptyfd, buf, 2);
+-			}
+-		}
+-		if(c == ' ' && get_shift_state()) {
+-			show_fig = hangul_automata_toggle(buf);
+-		}
+-		else {
+-			show_fig = hangul_automata(c, buf);
+-			if(show_fig == 0) {
+-				get_ime_status(constr);
+-				if(constr[0] == 0) { // bkspc: clear composing
+-					memset(constr, ' ', 2);
+-					tvterm_emulate(&(p->vterm), constr, 2);
+-				}
+-				else if(hangul_output_code == 0)
+-					tvterm_emulate(&(p->vterm), constr, 3);
+-				else
+-					tvterm_emulate(&(p->vterm), constr, 2);
+-				p->vterm.pen.x -= 2;
+-				tvterm_refresh(&(p->vterm));
+-			}
+-		}
+-		if(show_fig > 1) {
+-			if(hangul_output_code == 0)
+-				write(p->ptyfd, buf, show_fig + 1);
+-			else
+-				write(p->ptyfd, buf, show_fig);
+-			get_ime_status(constr);
+-			if(constr[0] != 0) hconstr = 1;
+-		}
+-		else if(show_fig == 1) write(p->ptyfd, buf, show_fig);
+-	}
+-}
+-else {
+-	write(p->ptyfd, buf, ret);
+-}
++                if (process_hangul_input) {
++                    togglekey_status_old  = togglekey_status;
++		            togglekey_status      = get_toggle_state();
++
++                    // status change
++                    if (togglekey_status_old != togglekey_status) {
++                        get_ime_status(han_last_char);
++                        // changed process buf string
++                        // if not use hangul_automata_clear()...
++                        // ENG -> HAN fix    read_buf: A -> A
++                        // HAN -> END modify read_buf: A -> (MIOUM)
++                        hangul_automata_clear();
++                        hangul_automata_toggle(read_buf);
++                        //debug_printf(&(p->vterm), "Cst:\"%s\"\"%s\"\n", read_buf, han_last_char);
++                    }
++
++	                for (i = 0; i < ret; i++) {
++                        // if you want change character... (must be use capslock toggle key!)
++                        convert_character(togglekey_status, read_buf[i], &capslock_convert_character);
++                        // if combine, print two character (not full)
++                        show_fig = hangul_automata(capslock_convert_character, read_buf);
++                        //debug_printf(&(p->vterm), "(%d)-'%c' '%d' \"%s\"", ret, capslock_convert_character, show_fig, read_buf);
++                        switch (show_fig) {
++                            // korean in cursor (print combine processing)
++                            // -> process buf : alphabet
++                            case 0:
++                                // get curser korean jamo
++                                get_ime_status(constr);
++                                //debug_printf(&(p->vterm), "Johap: '%s' '%d'\n", constr, constr[0]);
++                                // only event - selected (print combine process) + press backspace
++                                // now position character change, no move
++                                if (constr[0] == 0) { // bkspc: clear composing
++                                    memset(constr, ' ', 2);
++                                    tvterm_emulate(&(p->vterm), constr, 2);
++                                } else if (hangul_output_code == 0){
++                                    tvterm_emulate(&(p->vterm), constr, 3);
++                                } else {
++                                    tvterm_emulate(&(p->vterm), constr, 2);
++                                }
++
++                                p->vterm.pen.x -= 2;
++                                tvterm_refresh(&(p->vterm));
++                                break;
++                            // print ascsii character
++                            case 1:
++                                // flush korean
++                                if(strcmp(han_last_char, "") != 0){
++                                    if(hangul_output_code == 0) {
++                                        write(p->ptyfd, han_last_char, 3);
++                                    } else {
++                                        write(p->ptyfd, han_last_char, 2);
++                                    }
++                                    memset(han_last_char, 0, sizeof(han_last_char));
++                                }
++                                //debug_printf(&(p->vterm), "ASCII:'%s'\n", han_last_char);
++                                write(p->ptyfd, read_buf, show_fig);
++                                break;
++                            // korean character is full! unable insert more JAMO
++                            // -> read_buf: save hangul (!! Not certain character!, able change!)
++                            default:
++                                //debug_printf(&(p->vterm), "FL:'%s'\n", read_Buf);
++			                    if(hangul_output_code == 0) {
++				                    write(p->ptyfd, read_buf, show_fig + 1);
++                                } else {
++				                    write(p->ptyfd, read_buf, show_fig);
++                                }
++			
++                                get_ime_status(constr);
++                                if (constr[0] != 0) {
++                                    hconstr = 1;
++                                }
++                                break;
++		                    }
++	                    }
++                } else {
++	                write(p->ptyfd, read_buf, ret);
++                }
+ #else
+-				write(p->ptyfd, buf, ret);
++				write(p->ptyfd, read_buf, ret);
+ #endif
+ 			}
+-		} else if (FD_ISSET(p->ptyfd,&fds)) {
+-			ret = read(p->ptyfd, buf, BUF_SIZE);
++		} else if(FD_ISSET(p->ptyfd,&fds)) {
++			ret = read(p->ptyfd, read_buf, BUF_SIZE);
+ 			if (ret > 0) {
+-				/* write(1, buf, ret); */
+-				tvterm_emulate(&(p->vterm), buf, ret);
++				// write(1, read_buf, ret);
++				tvterm_emulate(&(p->vterm), read_buf, ret);
+ 				tvterm_refresh(&(p->vterm));
+-#if 1 // Hangul
+-if(process_hangul_input) {
+-	if(hconstr) {
+-		if(hangul_output_code == 0)
+-			tvterm_emulate(&(p->vterm), constr, 3);
+-		else
+-			tvterm_emulate(&(p->vterm), constr, 2);
+-		p->vterm.pen.x -= 2;
+-		tvterm_refresh(&(p->vterm));
+-		hconstr = 0;
+-	}
+-}
++#if 1 // Hangul - cursor out of character, print one FULL character, next forward
++      //          (if not use this section, last character is cut)
++                if (process_hangul_input) {
++	                if (hconstr) {
++		                if (hangul_output_code == 0) {
++			                tvterm_emulate(&(p->vterm), constr, 3);
++                        } else {
++			                tvterm_emulate(&(p->vterm), constr, 2);
++                        }
++		
++                        p->vterm.pen.x -= 2;
++                        tvterm_refresh(&(p->vterm));
++		                hconstr = 0;
++	                }
++                }
+ #endif
+ 			}
+ 		}
+@@ -367,5 +493,3 @@
+ 	pututline(utp);
+ 	endutent();
+ }
+-
+-
